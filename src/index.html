@@ -1,0 +1,638 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+  getAuth, 
+  signInAnonymously, 
+  signInWithCustomToken, 
+  onAuthStateChanged 
+} from 'firebase/auth';
+import { 
+  getFirestore, 
+  collection, 
+  doc, 
+  onSnapshot, 
+  addDoc, 
+  updateDoc,
+  deleteDoc 
+} from 'firebase/firestore';
+import { 
+  Users, FileText, Settings, 
+  CheckCircle, AlertCircle, Search, Download, Plus, Trash2, Edit3, Clock, Coffee, LogOut, LogIn, Monitor, MessageSquare, Calendar, ChevronDown, ChevronUp
+} from 'lucide-react';
+
+// --- Firebase 配置 (由環境提供，上線時請替換為您的實體配置) ---
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'kindergarten-punch-system';
+
+// --- 自定義載入圖標組件 ---
+const RefreshCw = ({ size, className }) => (
+  <div 
+    style={{ width: size, height: size }} 
+    className={`border-2 border-current border-t-transparent rounded-full animate-spin ${className || ''}`} 
+  />
+);
+
+// --- 系統常量定義 ---
+const PUNCH_TYPES = [
+  { id: '上班', icon: <LogIn size={20} />, color: 'bg-emerald-500' },
+  { id: '休息開始', icon: <Coffee size={20} />, color: 'bg-amber-500' },
+  { id: '休息結束', icon: <RefreshCw size={20} />, color: 'bg-blue-500' },
+  { id: '下班', icon: <LogOut size={20} />, color: 'bg-rose-500' }
+];
+
+const LEAVE_TYPES = ['事假', '病假', '公假', '特休假', '婚假', '喪假', '其他假別'];
+const EMPLOYEE_STATUSES = ['在職', '留停', '離職'];
+
+const App = () => {
+  const [user, setUser] = useState(null);
+  const [view, setView] = useState('home'); // home, main_station, admin, reports
+  const [employees, setEmployees] = useState([]);
+  const [attendance, setAttendance] = useState([]);
+  const [leaveRecords, setLeaveRecords] = useState([]);
+  const [lastPunchInfo, setLastPunchInfo] = useState(null);
+  const [feedback, setFeedback] = useState(null); 
+  const [isProcessing, setIsProcessing] = useState(false);
+  
+  // 管理端登入狀態持久化
+  const [adminIsLoggedIn, setAdminIsLoggedIn] = useState(false);
+
+  // --- 身份驗證初始化 (遵照規則 3) ---
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (error) {
+        console.error("Auth error:", error);
+      }
+    };
+    initAuth();
+    const unsubscribeAuth = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+    });
+    return () => unsubscribeAuth();
+  }, []);
+
+  // --- Firestore 資料即時監聽 (遵照規則 1 & 2) ---
+  useEffect(() => {
+    if (!user) return;
+
+    // 1. 監聽員工清單
+    const empRef = collection(db, 'artifacts', appId, 'public', 'data', 'employees');
+    const unsubEmp = onSnapshot(empRef, (snapshot) => {
+      setEmployees(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
+    }, (err) => console.error("員工資料監聽失敗", err));
+
+    // 2. 監聽打卡紀錄
+    const attRef = collection(db, 'artifacts', appId, 'public', 'data', 'attendance');
+    const unsubAtt = onSnapshot(attRef, (snapshot) => {
+      const data = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+      setAttendance(data);
+      if (data.length > 0) {
+        const sorted = [...data].sort((a, b) => b.timestamp - a.timestamp);
+        setLastPunchInfo(sorted[0]);
+      }
+    }, (err) => console.error("打卡紀錄監聽失敗", err));
+
+    // 3. 監聽請假紀錄
+    const leaveRef = collection(db, 'artifacts', appId, 'public', 'data', 'leave_records');
+    const unsubLeave = onSnapshot(leaveRef, (snapshot) => {
+      setLeaveRecords(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
+    }, (err) => console.error("請假紀錄監聽失敗", err));
+
+    return () => {
+      unsubEmp();
+      unsubAtt();
+      unsubLeave();
+    };
+  }, [user]);
+
+  // --- 打卡功能執行 ---
+  const handlePunch = async (phone, punchType) => {
+    if (isProcessing || !user) return;
+    setIsProcessing(true);
+    setFeedback(null);
+    
+    const emp = employees.find(e => e.phone === phone);
+    if (!emp) {
+      setFeedback({ success: false, message: "⚠️ 找不到員工資料！" });
+      setIsProcessing(false);
+      return;
+    }
+
+    if (emp.status === '離職') {
+      setFeedback({ success: false, message: "⚠️ 該員已離職，無法進行打卡。" });
+      setIsProcessing(false);
+      return;
+    }
+
+    const now = new Date();
+    try {
+      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'attendance'), {
+        employeeId: emp.id,
+        employeeName: emp.name,
+        employeeTitle: emp.title,
+        timestamp: now.getTime(),
+        dateStr: now.toLocaleDateString('zh-TW', { year: 'numeric', month: '2-digit', day: '2-digit' }).replace(/\//g, '-'),
+        timeStr: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+        punchType: punchType,
+        remark: '' 
+      });
+
+      setFeedback({
+        success: true,
+        message: `${punchType}成功！\n${emp.title} ${emp.name}`,
+        employee: emp
+      });
+      
+      setTimeout(() => setFeedback(null), 5000);
+    } catch (e) {
+      setFeedback({ success: false, message: "系統打卡失敗，請檢查連線。" });
+    }
+    
+    setIsProcessing(false);
+  };
+
+  // --- 視圖：打卡 + 看板整合頁面 ---
+  const MainPunchStation = () => {
+    const [phoneInput, setPhoneInput] = useState('');
+    const [isVerified, setIsVerified] = useState(false);
+    const [currentEmp, setCurrentEmp] = useState(null);
+
+    const handleVerify = () => {
+      const emp = employees.find(e => e.phone === phoneInput);
+      if (emp) {
+        if (emp.status === '離職') {
+          setFeedback({ success: false, message: "⚠️ 該員已離職。" });
+          return;
+        }
+        setCurrentEmp(emp);
+        setIsVerified(true);
+        setFeedback(null);
+        setPhoneInput(''); // 驗證後立即清空，方便下一位
+      } else {
+        setFeedback({ success: false, message: "⚠️ 號碼不正確或未註冊" });
+      }
+    };
+
+    return (
+      <div className="max-w-6xl mx-auto p-4 space-y-8 animate-in fade-in">
+        {/* 打卡區 */}
+        <section className="bg-white rounded-[3rem] shadow-xl border border-slate-100 overflow-hidden">
+          <div className="bg-blue-600 p-4 text-center">
+            <h3 className="text-white font-black flex items-center justify-center gap-2">
+              <Clock size={20} /> 員工快速打卡區
+            </h3>
+          </div>
+          
+          <div className="p-8 md:p-12 min-h-[40vh] flex flex-col items-center justify-center">
+            {!isVerified ? (
+              <div className="w-full max-w-md space-y-6 text-center">
+                <p className="text-slate-400 font-bold">請輸入手機號碼進行驗證</p>
+                <input 
+                  type="tel" 
+                  placeholder="請輸入手機號碼" 
+                  className="w-full p-6 border-2 border-slate-100 rounded-2xl text-3xl font-black focus:border-blue-500 outline-none shadow-inner text-center tracking-widest bg-slate-50"
+                  value={phoneInput}
+                  onChange={(e) => setPhoneInput(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleVerify()}
+                />
+                <button 
+                  onClick={handleVerify}
+                  className="w-full bg-blue-600 text-white py-5 rounded-2xl font-black text-xl shadow-lg active:scale-95 transition"
+                >
+                  確認身分
+                </button>
+              </div>
+            ) : (
+              <div className="w-full max-w-2xl text-center animate-in slide-in-from-bottom-4">
+                <div className="mb-8 flex items-center justify-center gap-6">
+                  <div className="text-left">
+                    <h2 className="text-4xl font-black text-slate-800">{currentEmp.name}</h2>
+                    <p className="text-blue-600 font-bold tracking-widest">{currentEmp.title} | {currentEmp.status}</p>
+                  </div>
+                  <button onClick={() => setIsVerified(false)} className="text-slate-300 hover:text-slate-500 font-bold text-sm underline">切換身分</button>
+                </div>
+                
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                  {PUNCH_TYPES.map(type => (
+                    <button 
+                      key={type.id}
+                      onClick={() => {
+                        handlePunch(currentEmp.phone, type.id);
+                        setIsVerified(false);
+                      }}
+                      className="group flex flex-col items-center gap-3 p-6 rounded-3xl bg-slate-50 hover:bg-slate-100 active:scale-95 transition-all border-2 border-transparent hover:border-slate-200"
+                    >
+                      <div className={`w-14 h-14 rounded-2xl flex items-center justify-center text-white shadow-md ${type.color}`}>
+                        {type.icon}
+                      </div>
+                      <span className="font-black text-slate-700">{type.id}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            
+            {feedback && (
+              <div className={`mt-6 p-4 rounded-xl shadow-lg flex items-center gap-4 animate-bounce ${feedback.success ? 'bg-emerald-500 text-white' : 'bg-rose-500 text-white'}`}>
+                {feedback.success ? <CheckCircle size={20} /> : <AlertCircle size={20} />}
+                <span className="font-bold whitespace-pre-line">{feedback.message}</span>
+              </div>
+            )}
+          </div>
+        </section>
+
+        {/* 即時看板區 */}
+        <section className="bg-slate-900 rounded-[3rem] p-8 md:p-12 shadow-2xl relative overflow-hidden text-center min-h-[40vh] flex flex-col items-center justify-center">
+          <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-blue-500 to-transparent"></div>
+          <h3 className="text-blue-400 font-black tracking-widest mb-10 flex items-center gap-2 justify-center">
+            <Monitor size={18} /> 即時出勤看板
+          </h3>
+          
+          {lastPunchInfo ? (
+            <div className="animate-in fade-in zoom-in duration-1000">
+              <h4 className="text-6xl font-black text-white mb-2">{lastPunchInfo.employeeName}</h4>
+              <p className="text-2xl font-bold text-slate-400 mb-8">{lastPunchInfo.employeeTitle}</p>
+              
+              <div className={`inline-flex items-center gap-3 px-10 py-5 rounded-full text-white font-black text-3xl shadow-2xl ${
+                lastPunchInfo.punchType === '上班' ? 'bg-emerald-500' :
+                lastPunchInfo.punchType === '休息開始' ? 'bg-amber-500' :
+                lastPunchInfo.punchType === '休息結束' ? 'bg-blue-500' :
+                lastPunchInfo.punchType === '下班' ? 'bg-rose-500' : 'bg-slate-500'
+              }`}>
+                {lastPunchInfo.punchType}
+              </div>
+              
+              <p className="mt-12 text-slate-500 font-mono font-bold tracking-widest">
+                最後更新：{lastPunchInfo.timeStr} ({lastPunchInfo.dateStr})
+              </p>
+            </div>
+          ) : (
+            <p className="text-slate-600 font-bold text-xl italic">等待今日首位同仁打卡...</p>
+          )}
+        </section>
+      </div>
+    );
+  };
+
+  // --- 視圖：管理中心 ---
+  const AdminPanel = () => {
+    const [pass, setPass] = useState('');
+    const [showAdd, setShowAdd] = useState(false);
+    const [showLeave, setShowLeave] = useState(false);
+    const [selectedEmpForLeave, setSelectedEmpForLeave] = useState(null);
+    const [isResignedExpanded, setIsResignedExpanded] = useState(false);
+    
+    const [editingEmp, setEditingEmp] = useState(null);
+    const [empForm, setEmpForm] = useState({ name: '', title: '', phone: '', status: '在職' });
+    const [leaveForm, setLeaveForm] = useState({
+      type: '事假', startDate: '', endDate: '', startTime: '08:00', endTime: '17:00', note: ''
+    });
+
+    if (!adminIsLoggedIn) {
+      return (
+        <div className="flex flex-col items-center justify-center min-h-[60vh] p-4">
+          <div className="bg-white p-10 rounded-[2.5rem] shadow-2xl w-full max-w-md border border-slate-100">
+            <h2 className="text-2xl font-black mb-8 text-center text-slate-800">管理端驗證</h2>
+            <input 
+              type="password" 
+              className="w-full p-4 border rounded-2xl mb-6 text-center text-xl tracking-[0.5em] focus:ring-4 focus:ring-blue-100 outline-none transition text-slate-800" 
+              value={pass}
+              onChange={(e) => setPass(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && (pass === 'admin888' ? setAdminIsLoggedIn(true) : alert('密碼錯誤'))}
+            />
+            <button 
+              onClick={() => pass === 'admin888' ? setAdminIsLoggedIn(true) : alert('密碼錯誤')}
+              className="w-full bg-slate-900 text-white py-4 rounded-2xl font-black text-lg active:scale-95 transition"
+            >
+              進入管理後台
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    const saveEmployee = async () => {
+      if(!empForm.name || !empForm.phone) return alert('姓名與電話必填');
+      try {
+        if (editingEmp) {
+          await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'employees', editingEmp.id), empForm);
+          setEditingEmp(null);
+        } else {
+          await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'employees'), empForm);
+        }
+        setEmpForm({ name: '', title: '', phone: '', status: '在職' });
+      } catch (e) { alert('儲存失敗'); }
+    };
+
+    const saveLeaveRequest = async () => {
+      if (!selectedEmpForLeave || !leaveForm.startDate || !leaveForm.endDate) return alert('資訊未填寫完整');
+      try {
+        await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'leave_records'), {
+          employeeId: selectedEmpForLeave.id,
+          employeeName: selectedEmpForLeave.name,
+          employeeTitle: selectedEmpForLeave.title,
+          ...leaveForm,
+          timestamp: new Date(leaveForm.startDate).getTime()
+        });
+        alert('請假單已儲存');
+        setShowLeave(false);
+        setSelectedEmpForLeave(null);
+        setLeaveForm({ type: '事假', startDate: '', endDate: '', startTime: '08:00', endTime: '17:00', note: '' });
+      } catch (e) { alert('儲存失敗'); }
+    };
+
+    const activeEmps = employees.filter(e => (e.status || '在職') === '在職');
+    const onLeaveEmps = employees.filter(e => e.status === '留停');
+    const resignedEmps = employees.filter(e => e.status === '離職');
+
+    const EmployeeRow = ({ emp }) => (
+      <tr className="hover:bg-slate-50/50 transition">
+        <td className="p-4">
+          <span className={`px-3 py-1 rounded-full text-xs font-black ${
+            emp.status === '離職' ? 'bg-slate-100 text-slate-400' :
+            emp.status === '留停' ? 'bg-amber-100 text-amber-600' :
+            'bg-emerald-100 text-emerald-600'
+          }`}>{emp.status || '在職'}</span>
+        </td>
+        <td className="p-4 font-black text-slate-700">{emp.name}</td>
+        <td className="p-4 font-medium text-slate-500">{emp.title}</td>
+        <td className="p-4 font-mono text-blue-600 font-bold">{emp.phone}</td>
+        <td className="p-4 text-center">
+          <div className="flex items-center justify-center gap-4">
+            <button onClick={() => {
+              setEditingEmp(emp);
+              setEmpForm({ name: emp.name, title: emp.title, phone: emp.phone, status: emp.status || '在職' });
+              setShowAdd(true); setShowLeave(false);
+              window.scrollTo({ top: 0, behavior: 'smooth' });
+            }} className="text-blue-300 hover:text-blue-600"><Edit3 size={18} /></button>
+            <button onClick={() => confirm(`確定刪除 ${emp.name}？`) && deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'employees', emp.id))} className="text-rose-200 hover:text-rose-500"><Trash2 size={18} /></button>
+          </div>
+        </td>
+      </tr>
+    );
+
+    return (
+      <div className="p-4 md:p-8 max-w-6xl mx-auto">
+        <div className="flex justify-between items-center mb-8">
+          <h2 className="text-3xl font-black text-slate-800">員工名冊管理</h2>
+          <div className="flex gap-2">
+            <button onClick={() => setAdminIsLoggedIn(false)} className="bg-slate-100 text-slate-400 px-4 py-3 rounded-2xl font-bold hover:bg-slate-200 transition text-sm">登出</button>
+            <button onClick={() => { setShowAdd(!showAdd); setShowLeave(false); setEditingEmp(null); }} className={`px-6 py-3 rounded-2xl font-bold flex items-center gap-2 shadow-lg transition ${showAdd ? 'bg-slate-200 text-slate-600' : 'bg-blue-600 text-white'}`}><Plus size={20} /> 新增員工</button>
+            <button onClick={() => { setShowLeave(!showLeave); setShowAdd(false); setSelectedEmpForLeave(null); }} className={`px-6 py-3 rounded-2xl font-bold flex items-center gap-2 shadow-lg transition ${showLeave ? 'bg-slate-200 text-slate-600' : 'bg-indigo-600 text-white'}`}><Calendar size={20} /> 員工請假</button>
+          </div>
+        </div>
+
+        {showAdd && (
+          <div className="bg-white p-8 rounded-3xl mb-10 shadow-sm border-2 border-blue-50 grid grid-cols-1 md:grid-cols-5 gap-4 animate-in slide-in-from-top-4">
+            <div className="flex flex-col gap-2"><label className="text-xs font-bold text-slate-400 px-1">現職狀況</label><select className="p-3 border rounded-xl bg-white" value={empForm.status} onChange={e => setEmpForm({...empForm, status: e.target.value})}>{EMPLOYEE_STATUSES.map(s => <option key={s} value={s}>{s}</option>)}</select></div>
+            <div className="flex flex-col gap-2"><label className="text-xs font-bold text-slate-400 px-1">員工姓名</label><input className="p-3 border rounded-xl" value={empForm.name} onChange={e => setEmpForm({...empForm, name: e.target.value})} /></div>
+            <div className="flex flex-col gap-2"><label className="text-xs font-bold text-slate-400 px-1">職稱</label><input className="p-3 border rounded-xl" value={empForm.title} onChange={e => setEmpForm({...empForm, title: e.target.value})} /></div>
+            <div className="flex flex-col gap-2"><label className="text-xs font-bold text-slate-400 px-1">手機號碼</label><input className="p-3 border rounded-xl" value={empForm.phone} onChange={e => setEmpForm({...empForm, phone: e.target.value})} /></div>
+            <div className="flex items-end gap-2"><button onClick={saveEmployee} className="bg-emerald-600 text-white p-3 rounded-xl flex-1 font-bold shadow-md">{editingEmp ? '確認修改' : '儲存並繼續新增'}</button></div>
+          </div>
+        )}
+
+        {showLeave && (
+          <div className="bg-white p-8 rounded-3xl mb-10 shadow-sm border-2 border-indigo-50 animate-in slide-in-from-top-4">
+            {!selectedEmpForLeave ? (
+              <div>
+                <h3 className="text-lg font-black text-slate-800 mb-6 flex items-center gap-2"><Users size={20} className="text-indigo-600"/> 第一步：選擇請假同仁</h3>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                  {employees.filter(e => e.status !== '離職').map(emp => (
+                    <button key={emp.id} onClick={() => setSelectedEmpForLeave(emp)} className="p-4 border rounded-2xl hover:bg-indigo-50 hover:border-indigo-200 transition text-left group">
+                      <div className="font-black text-slate-700">{emp.name}</div>
+                      <div className="text-xs text-slate-400">{emp.title}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-6">
+                <h3 className="text-lg font-black text-slate-800 flex items-center gap-2 border-b pb-4"><Calendar size={20} className="text-indigo-600"/> 錄入請假單：{selectedEmpForLeave.name}</h3>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                  <div className="flex flex-col gap-2"><label className="text-xs font-bold text-slate-400">請假假別</label><select className="p-3 border rounded-xl bg-white" value={leaveForm.type} onChange={e => setLeaveForm({...leaveForm, type: e.target.value})}>{LEAVE_TYPES.map(t => <option key={t} value={t}>{t}</option>)}</select></div>
+                  <div className="flex flex-col gap-2"><label className="text-xs font-bold text-slate-400">開始日期</label><input type="date" className="p-3 border rounded-xl" value={leaveForm.startDate} onChange={e => setLeaveForm({...leaveForm, startDate: e.target.value})} /></div>
+                  <div className="flex flex-col gap-2"><label className="text-xs font-bold text-slate-400">結束日期</label><input type="date" className="p-3 border rounded-xl" value={leaveForm.endDate} onChange={e => setLeaveForm({...leaveForm, endDate: e.target.value})} /></div>
+                  <div className="flex flex-col gap-2"><label className="text-xs font-bold text-slate-400">開始時間</label><input type="time" className="p-3 border rounded-xl" value={leaveForm.startTime} onChange={e => setLeaveForm({...leaveForm, startTime: e.target.value})} /></div>
+                  <div className="flex flex-col gap-2"><label className="text-xs font-bold text-slate-400">結束時間</label><input type="time" className="p-3 border rounded-xl" value={leaveForm.endTime} onChange={e => setLeaveForm({...leaveForm, endTime: e.target.value})} /></div>
+                  <div className="flex flex-col gap-2"><label className="text-xs font-bold text-slate-400">主管備註</label><input className="p-3 border rounded-xl" value={leaveForm.note} onChange={e => setLeaveForm({...leaveForm, note: e.target.value})} /></div>
+                </div>
+                <div className="flex gap-2 justify-end"><button onClick={saveLeaveRequest} className="px-12 py-3 bg-indigo-600 text-white rounded-xl font-black shadow-lg">確認儲存</button></div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* 分組清單 */}
+        <div className="space-y-6">
+          <section className="bg-white rounded-[2.5rem] shadow-sm border border-slate-100 overflow-hidden">
+            <div className="bg-emerald-50 px-6 py-4 flex items-center justify-between border-b border-emerald-100">
+              <h3 className="font-black text-emerald-800 flex items-center gap-2"><CheckCircle size={18}/> 在職人員 ({activeEmps.length})</h3>
+            </div>
+            <table className="w-full text-left"><tbody className="divide-y divide-slate-50">{activeEmps.map(emp => <EmployeeRow key={emp.id} emp={emp} />)}</tbody></table>
+          </section>
+
+          {onLeaveEmps.length > 0 && (
+            <section className="bg-amber-50/30 rounded-[2.5rem] shadow-sm border border-amber-100 overflow-hidden">
+              <div className="bg-amber-50 px-6 py-4 flex items-center justify-between border-b border-amber-100">
+                <h3 className="font-black text-amber-800 flex items-center gap-2"><Clock size={18}/> 留停人員 ({onLeaveEmps.length})</h3>
+              </div>
+              <table className="w-full text-left"><tbody className="divide-y divide-amber-50">{onLeaveEmps.map(emp => <EmployeeRow key={emp.id} emp={emp} />)}</tbody></table>
+            </section>
+          )}
+
+          {resignedEmps.length > 0 && (
+            <section className="bg-slate-50/50 rounded-[2.5rem] shadow-sm border border-slate-200 overflow-hidden">
+              <button onClick={() => setIsResignedExpanded(!isResignedExpanded)} className="w-full bg-slate-100 px-6 py-4 flex items-center justify-between border-b border-slate-200 hover:bg-slate-200/50 transition">
+                <h3 className="font-black text-slate-500 flex items-center gap-2"><LogOut size={18}/> 離職人員 ({resignedEmps.length})</h3>
+                {isResignedExpanded ? <ChevronUp size={20}/> : <ChevronDown size={20}/>}
+              </button>
+              {isResignedExpanded && (
+                <table className="w-full text-left bg-white/50 animate-in slide-in-from-top-2"><tbody className="divide-y divide-slate-100">{resignedEmps.map(emp => <EmployeeRow key={emp.id} emp={emp} />)}</tbody></table>
+              )}
+            </section>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  // --- 視圖：報表中心 ---
+  const ReportsView = () => {
+    const [filterStart, setFilterStart] = useState('');
+    const [filterEnd, setFilterEnd] = useState('');
+
+    const combinedData = [
+      ...attendance.map(a => ({ ...a, recordType: 'punch' })),
+      ...leaveRecords.map(l => ({ 
+        ...l, 
+        recordType: 'leave', 
+        dateStr: `${l.startDate} ~ ${l.endDate}`,
+        timeStr: `${l.startTime} ~ ${l.endTime}`,
+        punchType: `請假(${l.type})`,
+        remark: l.note 
+      }))
+    ].sort((a, b) => b.timestamp - a.timestamp);
+
+    const filteredData = combinedData.filter(record => {
+      if (!filterStart && !filterEnd) return true;
+      const recordDate = record.recordType === 'punch' ? new Date(record.timestamp) : new Date(record.startDate);
+      const start = filterStart ? new Date(filterStart) : null;
+      const end = filterEnd ? new Date(filterEnd) : null;
+      if (end) end.setHours(23, 59, 59, 999);
+      if (start && recordDate < start) return false;
+      if (end && recordDate > end) return false;
+      return true;
+    });
+
+    const updateRemark = async (id, val, type) => {
+      const col = type === 'punch' ? 'attendance' : 'leave_records';
+      const field = type === 'punch' ? 'remark' : 'note';
+      await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', col, id), { [field]: val });
+    };
+
+    return (
+      <div className="p-4 md:p-8 max-w-7xl mx-auto animate-in fade-in">
+        <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-10 gap-6">
+          <div className="flex flex-col gap-4">
+            <h2 className="text-3xl font-black text-slate-800">考勤/請假歷史報表</h2>
+            <div className="flex flex-wrap items-center gap-3 bg-white p-4 rounded-2xl shadow-sm border border-slate-100">
+              <label className="text-xs font-bold text-slate-400">查詢期間</label>
+              <input type="date" className="p-2 border rounded-xl text-sm outline-none focus:ring-2 focus:ring-blue-100" value={filterStart} onChange={(e) => setFilterStart(e.target.value)} />
+              <span className="text-slate-300">~</span>
+              <input type="date" className="p-2 border rounded-xl text-sm outline-none focus:ring-2 focus:ring-blue-100" value={filterEnd} onChange={(e) => setFilterEnd(e.target.value)} />
+              <button onClick={() => { setFilterStart(''); setFilterEnd(''); }} className="text-xs text-blue-600 font-bold ml-2 hover:underline">顯示全部</button>
+            </div>
+          </div>
+          <button onClick={() => { 
+            const headers = ["姓名", "職稱", "日期/區間", "時間", "類別", "備註"]; 
+            const rows = filteredData.map(a => [a.employeeName, a.employeeTitle, a.dateStr, a.timeStr, a.punchType, a.remark || '']); 
+            const csv = [headers, ...rows].map(e => e.join(",")).join("\n"); 
+            const blob = new Blob(["\ufeff" + csv], { type: 'text/csv;charset=utf-8;' }); 
+            const url = URL.createObjectURL(blob); 
+            const link = document.createElement("a"); link.href = url; link.download = `考勤報表_${filterStart || '始'}~${filterEnd || '末'}.csv`; link.click(); 
+          }} className="bg-emerald-600 text-white px-8 py-4 rounded-2xl font-black flex items-center gap-2 shadow-lg shadow-emerald-50 active:scale-95 transition">
+            <Download size={22} /> 匯出區間 CSV
+          </button>
+        </div>
+
+        <div className="bg-white rounded-[2rem] shadow-sm border border-slate-100 overflow-hidden">
+          <table className="w-full text-left">
+            <thead className="bg-slate-50 border-b">
+              <tr>
+                <th className="p-4 text-xs font-bold text-slate-400">姓名</th>
+                <th className="p-4 text-xs font-bold text-slate-400">職稱</th>
+                <th className="p-4 text-xs font-bold text-slate-400">日期/區間</th>
+                <th className="p-4 text-xs font-bold text-slate-400">時間</th>
+                <th className="p-4 text-xs font-bold text-slate-400">打卡類別</th>
+                <th className="p-4 text-xs font-bold text-slate-400">主管備註</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-50">
+              {filteredData.map(record => (
+                <tr key={record.id} className={`hover:bg-slate-50/50 transition ${record.recordType === 'leave' ? 'bg-indigo-50/10' : ''}`}>
+                  <td className="p-4 font-black text-slate-700">{record.employeeName}</td>
+                  <td className="p-4 text-slate-500 text-sm">{record.employeeTitle}</td>
+                  <td className="p-4 text-slate-400 font-mono text-xs">{record.dateStr}</td>
+                  <td className="p-4 text-slate-400 font-mono text-xs">{record.timeStr}</td>
+                  <td className="p-4">
+                    <span className={`px-3 py-1 rounded-full text-[10px] font-black text-white ${
+                      record.recordType === 'leave' ? 'bg-indigo-500' : 
+                      record.punchType === '上班' ? 'bg-emerald-500' : 
+                      record.punchType === '休息開始' ? 'bg-amber-500' : 
+                      record.punchType === '休息結束' ? 'bg-blue-500' : 
+                      record.punchType === '下班' ? 'bg-rose-500' : 'bg-slate-500'
+                    }`}>
+                      {record.punchType}
+                    </span>
+                  </td>
+                  <td className="p-4">
+                    <input 
+                      className="border-none bg-transparent hover:bg-white focus:bg-white focus:ring-1 rounded px-2 py-1 text-sm w-full outline-none transition italic text-slate-500" 
+                      defaultValue={record.remark} 
+                      onBlur={(e) => updateRemark(record.id, e.target.value, record.recordType)} 
+                      placeholder="點擊新增備註..." 
+                    />
+                  </td>
+                </tr>
+              ))}
+              {filteredData.length === 0 && (
+                <tr>
+                  <td colSpan="6" className="p-20 text-center text-slate-300 font-medium italic">此區間內尚無任何考勤數據</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div className="min-h-screen bg-[#FDFDFD] text-slate-900 font-sans selection:bg-blue-100">
+      <nav className="bg-white/80 backdrop-blur-xl border-b sticky top-0 z-[60] px-6">
+        <div className="max-w-7xl mx-auto h-20 flex items-center justify-between">
+          <div onClick={() => setView('home')} className="flex items-center gap-3 cursor-pointer group">
+            <div className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center text-white font-black text-xl shadow-lg group-hover:rotate-12 transition">P</div>
+            <div className="flex flex-col leading-tight">
+               <span className="font-black text-lg">培爾傑特</span>
+               <span className="text-[10px] font-bold text-blue-600 tracking-[0.2em] uppercase">Attendance V2.5</span>
+            </div>
+          </div>
+          <div className="flex bg-slate-50 p-1.5 rounded-2xl gap-1">
+            <button onClick={() => setView('main_station')} className={`px-4 py-2 rounded-xl flex items-center gap-2 transition ${view === 'main_station' ? 'bg-white shadow-sm text-blue-600' : 'text-slate-400 hover:bg-white/50'}`}>
+              <Clock size={18}/><span className="text-sm font-bold hidden sm:inline">打卡看板</span>
+            </button>
+            <button onClick={() => setView('admin')} className={`px-4 py-2 rounded-xl flex items-center gap-2 transition ${view === 'admin' ? 'bg-white shadow-sm text-blue-600' : 'text-slate-400 hover:bg-white/50'}`}>
+              <Settings size={18}/><span className="text-sm font-bold hidden sm:inline">管理</span>
+            </button>
+            <button onClick={() => setView('reports')} className={`px-4 py-2 rounded-xl flex items-center gap-2 transition ${view === 'reports' ? 'bg-white shadow-sm text-blue-600' : 'text-slate-400 hover:bg-white/50'}`}>
+              <FileText size={18}/><span className="text-sm font-bold hidden sm:inline">報表</span>
+            </button>
+          </div>
+        </div>
+      </nav>
+
+      <main className="animate-in fade-in duration-500">
+        {view === 'home' && (
+          <div className="max-w-5xl mx-auto pt-24 px-8 text-center">
+            <h1 className="text-6xl md:text-7xl font-black mb-8 tracking-tighter leading-tight">考勤與請假，<br/><span className="text-transparent bg-clip-text bg-gradient-to-r from-blue-600 to-indigo-500">一站式完美掌握。</span></h1>
+            <p className="text-xl text-slate-400 max-w-2xl mx-auto mb-16 font-medium leading-relaxed">
+              整合行動打卡站、即時動態看板與智慧行政報表。<br/>為幼兒園量身打造的雲端人事考勤方案。
+            </p>
+            <div className="flex flex-col sm:flex-row gap-4 justify-center">
+               <button onClick={() => setView('main_station')} className="bg-blue-600 text-white px-10 py-5 rounded-[2rem] font-black text-2xl shadow-2xl shadow-blue-200 active:scale-95 transition">
+                 進入打卡站
+               </button>
+               <button onClick={() => setView('admin')} className="bg-white border-2 border-slate-100 px-10 py-5 rounded-[2rem] font-black text-2xl shadow-xl hover:bg-slate-50 transition">
+                 後台管理
+               </button>
+            </div>
+          </div>
+        )}
+        {view === 'main_station' && <MainPunchStation />}
+        {view === 'admin' && <AdminPanel />}
+        {view === 'reports' && <ReportsView />}
+      </main>
+      
+      <style>{`
+        .animate-in { animation: fadeIn 0.5s ease-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 10px; }
+        ::-webkit-scrollbar-thumb:hover { background: #cbd5e1; }
+      `}</style>
+    </div>
+  );
+};
+
+export default App;
