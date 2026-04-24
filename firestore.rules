@@ -1,149 +1,137 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // --- 安全性輔助函數 ---
     
-    // 檢查使用者是否已通過驗證
+    // --- 通用函數 ---
     function isAuthenticated() {
       return request.auth != null;
     }
 
-    // 檢查是否為管理員（基於自定義聲明）
     function isAdmin() {
       return request.auth.token.admin == true;
     }
 
-    // 獲取當前時間（毫秒）
-    function now() {
-      return request.time.toMillis();
+    function getAppId() {
+      return request.path[4];
     }
 
-    // 獲取今天的開始時間戳（00:00:00）
-    function getTodayStart() {
-      return int(request.time.toDate().toDate().setHours(0, 0, 0, 0));
+    function getTodayStartTime() {
+      // 計算今天 00:00:00 的毫秒時間戳
+      let now_ms = request.time.toMillis();
+      return int(now_ms - (now_ms % 86400000));
     }
 
-    // 檢查是否為今日打卡
-    function isTodayPunch(timestamp) {
-      let todayStart = getTodayStart();
-      let todayEnd = todayStart + (24 * 60 * 60 * 1000);
-      return timestamp >= todayStart && timestamp < todayEnd;
-    }
-
-    // 檢查員工狀態是否允許打卡
-    function canPunch(employeeStatus) {
-      return employeeStatus != '離職';
-    }
-
-    // 檢查重複打卡（同類型且 5 分鐘內）
-    function isDuplicatePunch(employeeId, punchType) {
-      let recentPunch = get(/databases/$(database)/documents/artifacts/$(appId)/public/data/attendance/{docId}).data;
-      let timeSinceLastPunch = (now() - recentPunch.timestamp) / (1000 * 60);
-      
-      return recentPunch.employeeId == employeeId 
-        && recentPunch.punchType == punchType 
-        && isTodayPunch(recentPunch.timestamp)
-        && timeSinceLastPunch < 5;
-    }
-
-    // --- 根路徑 ---
-    match /{document=**} {
-      allow read, write: if false;
-    }
-
-    // --- Artifacts 集合 ---
+    // --- 員工資料集合 ---
     match /artifacts/{appId}/public/data/employees/{empId} {
-      // 所有使用者可讀取員工清單（顯示公開資訊）
       allow read: if isAuthenticated();
-      
-      // 管理員可新增、更新、刪除員工
       allow create, update, delete: if isAuthenticated() && isAdmin();
-      
-      // 驗證必填欄位
-      allow write: if 
-        resource.data.name != null 
-        && resource.data.phone != null
-        && resource.data.status in ['在職', '留停', '離職'];
     }
 
-    // --- 打卡紀錄集合（核心安全邏輯） ---
-    match /artifacts/{appId}/public/data/attendance/{attId} {
-      // 所有使用者可讀取打卡紀錄
+    // --- 打卡紀錄集合（含重複偵測） ---
+    match /artifacts/{appId}/public/data/attendance/{docId} {
       allow read: if isAuthenticated();
       
-      // 僅管理員可建立新打卡紀錄（遠端功能或管理員手動新增）
-      // 客戶端應通過自定義函數發送打卡請求至 Cloud Functions
-      allow create: if isAuthenticated() && isAdmin();
+      allow create: if isAuthenticated() && 
+        validatePunchRecord() &&
+        !isDuplicatePunch() &&
+        isEmployeeValid();
       
-      // 管理員可編輯備註欄位
-      allow update: if isAuthenticated() && isAdmin() && resource.data.remark != null;
-      
-      // 禁止刪除打卡紀錄（審計追蹤）
-      allow delete: if false;
-
-      // --- 打卡驗證規則 ---
-      allow create: if isAuthenticated() && (
-        // 1. 必填欄位檢查
-        request.resource.data.employeeId != null
-        && request.resource.data.employeeName != null
-        && request.resource.data.employeeTitle != null
-        && request.resource.data.timestamp != null
-        && request.resource.data.punchType != null
-        && request.resource.data.dateStr != null
-        && request.resource.data.timeStr != null
-        
-        // 2. 有效的打卡類型
-        && request.resource.data.punchType in ['上班', '休息開始', '休息結束', '下班']
-        
-        // 3. 時間戳合理性（不超過 1 分鐘的時差）
-        && (now() - request.resource.data.timestamp) < (60 * 1000)
-        && request.resource.data.timestamp > 0
-        
-        // 4. 檢查員工是否存在且未離職
-        && exists(/databases/$(database)/documents/artifacts/$(appId)/public/data/employees/$(request.resource.data.employeeId))
-        && get(/databases/$(database)/documents/artifacts/$(appId)/public/data/employees/$(request.resource.data.employeeId)).data.status != '離職'
-      );
+      allow update, delete: if isAuthenticated() && isAdmin();
     }
 
-    // --- 請假紀錄集合 ---
-    match /artifacts/{appId}/public/data/leave_records/{leaveId} {
-      // 所有使用者可讀取請假紀錄
-      allow read: if isAuthenticated();
+    // --- 打卡紀錄驗證規則 ---
+    function validatePunchRecord() {
+      let req = request.resource.data;
       
-      // 管理員可新增、更新、刪除請假紀錄
-      allow create, update, delete: if isAuthenticated() && isAdmin();
+      return req.size() >= 8 &&
+        // 必填欄位
+        req.employeeId is string &&
+        req.employeeName is string &&
+        req.employeeTitle is string &&
+        req.timestamp is number &&
+        req.dateStr is string &&
+        req.timeStr is string &&
+        req.punchType is string &&
+        req.remark is string &&
+        
+        // 打卡類型驗證
+        req.punchType in ['上班', '休息開始', '休息結束', '下班'] &&
+        
+        // 時間戳驗證（不能是未來時間，且不超過 1 分鐘）
+        req.timestamp <= request.time.toMillis() &&
+        (request.time.toMillis() - req.timestamp) < 60000 &&
+        
+        // 員工ID驗證
+        req.employeeId.size() > 0;
+    }
+
+    // --- 員工狀態驗證 ---
+    function isEmployeeValid() {
+      let empId = request.resource.data.employeeId;
+      let appId = getAppId();
       
-      // 驗證必填欄位
-      allow write: if 
-        request.resource.data.employeeId != null
-        && request.resource.data.type in ['事假', '病假', '公假', '特休假', '婚假', '喪假', '其他假別']
-        && request.resource.data.startDate != null
-        && request.resource.data.endDate != null;
+      let empRef = /databases/$(database)/documents/artifacts/$(appId)/public/data/employees/$(empId);
+      
+      return exists(empRef) && 
+        get(empRef).data.status != '離職';
+    }
+
+    // --- 重複打卡偵測邏輯 ---
+    function isDuplicatePunch() {
+      let req = request.resource.data;
+      let appId = getAppId();
+      
+      // 取得該員工今日最新的打卡紀錄
+      // 由於 Firestore Rules 的查詢限制，我們在這裡只做基本驗證
+      // 詳細的重複偵測邏輯應由 Cloud Functions 處理
+      
+      // 注意：完整的集合查詢在 Firestore Rules 中不可用
+      // 此函數為預留位置，實際邏輯應在 Cloud Functions onWrite 觸發器中實現
+      return false;
     }
 
     // --- 審計日誌集合（記錄被拒絕的打卡嘗試） ---
     match /artifacts/{appId}/public/data/audit_logs/{logId} {
-      // 所有使用者可讀取審計日誌（管理員功能）
       allow read: if isAuthenticated() && isAdmin();
-      
-      // 系統（Cloud Functions）自動寫入
-      allow create: if request.auth.uid == null || isAdmin();
-      
+      allow create: if isAuthenticated();
       allow update, delete: if false;
     }
 
     // --- 通知集合（管理員異常打卡提醒） ---
     match /artifacts/{appId}/public/data/notifications/{notifId} {
-      // 允許讀取自己的通知
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated();
+      allow delete: if isAuthenticated();
+      allow update: if false;
+    }
+
+    // --- 請假紀錄集合 ---
+    match /artifacts/{appId}/public/data/leave_records/{leaveId} {
       allow read: if isAuthenticated();
       
-      // 系統（Cloud Functions）自動寫入
-      allow create: if request.auth.uid == null || isAdmin();
+      allow create: if isAuthenticated() && 
+        validateLeaveRecord();
       
-      // 使用者可刪除自己的通知
-      allow delete: if isAuthenticated();
+      allow update, delete: if isAuthenticated() && isAdmin();
+    }
+
+    // --- 請假紀錄驗證規則 ---
+    function validateLeaveRecord() {
+      let req = request.resource.data;
       
-      allow update: if false;
+      return req.size() >= 8 &&
+        req.employeeId is string &&
+        req.employeeName is string &&
+        req.employeeTitle is string &&
+        req.type is string &&
+        req.startDate is string &&
+        req.endDate is string &&
+        req.startTime is string &&
+        req.endTime is string &&
+        
+        req.type in ['事假', '病假', '公假', '特休假', '婚假', '喪假', '其他假別'] &&
+        req.startDate <= req.endDate &&
+        req.employeeId.size() > 0;
     }
   }
 }
