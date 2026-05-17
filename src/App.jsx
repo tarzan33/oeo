@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
+import { Analytics } from '@vercel/analytics/react';
 import { initializeApp } from 'firebase/app';
 import { 
   getAuth, 
@@ -21,10 +22,11 @@ import {
 } from 'firebase/firestore';
 import { 
   Users, FileText, Settings, 
-  CheckCircle, AlertCircle, Search, Download, Plus, Trash2, Edit3, Clock, Coffee, LogOut, LogIn, Monitor, MessageSquare, Calendar, ChevronDown, ChevronUp
+  CheckCircle, AlertCircle, Download, Plus, Trash2, Edit3, Clock, Coffee, LogOut, LogIn, Monitor, Calendar, ChevronDown, ChevronUp
 } from 'lucide-react';
 
 // --- Firebase 配置 (由環境提供，上線時請替換為您的實體配置) ---
+/* global __firebase_config, __app_id, __initial_auth_token */
 const firebaseConfig = JSON.parse(__firebase_config);
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
@@ -501,7 +503,7 @@ const App = () => {
           <div className="bg-white p-8 rounded-3xl mb-10 shadow-sm border-2 border-indigo-50 animate-in slide-in-from-top-4">
             {!selectedEmpForLeave ? (
               <div>
-                <h3 className="text-lg font-black text-slate-800 mb-6 flex items-center gap-2"><Users size={20} className="text-indigo-600"/> 第一步：選擇請假同仁</h3>
+                <h3 className="text-lg font-black text-slate-800 mb-6 flex items-center gap-2"><Users size={20} className="text-indigo-600"/> 第���步：選擇請假同仁</h3>
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                   {employees.filter(e => e.status !== '離職').map(emp => (
                     <button key={emp.id} onClick={() => setSelectedEmpForLeave(emp)} className="p-4 border rounded-2xl hover:bg-indigo-50 hover:border-indigo-200 transition text-left group">
@@ -728,6 +730,7 @@ const App = () => {
         ::-webkit-scrollbar-thumb { background: #e2e8f0; border-radius: 10px; }
         ::-webkit-scrollbar-thumb:hover { background: #cbd5e1; }
       `}</style>
+      <Analytics />
     </div>
   );
 };

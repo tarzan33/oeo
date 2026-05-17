@@ -88,7 +88,7 @@ export const validateDailyPunchSequence = (attendance, employeeId, dateStr) => {
   let expectedIndex = 0;
   const usedTypes = new Set();
 
-  todayPunches.forEach((punch, idx) => {
+  todayPunches.forEach((punch) => {
     // 檢查是否出現重複的同類型打卡
     if (usedTypes.has(punch.punchType)) {
       issues.push(`${punch.timeStr} 重複的「${punch.punchType}」打卡`);
